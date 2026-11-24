@@ -20,6 +20,8 @@ import {
 import { api, post, minutes } from "./api";
 import type { Employee } from "./api";
 import CameraZones from "./CameraZones";
+import DoorZoneEditor from "./DoorZoneEditor";
+import DoorwayTimeLogs from "./DoorwayTimeLogs";
 import { EnrollmentPhotos, SavedEnrollmentSamples } from "./EnrollmentPhotos";
 import type { EnrollmentSample } from "./EnrollmentPhotos";
 import DailyProfiles from "./DailyProfiles";
@@ -123,6 +125,12 @@ function Preview({
   const [geometry, setGeometry] = useState<{
     zones?: { name: string; points: number[][] }[];
     line?: { axis: string; position: number } | null;
+    door?: {
+      version: number;
+      entry_forward: boolean;
+      zones: { role: string; name: string; points: number[][] }[];
+    } | null;
+    anchors?: { track_id: number; point: number[]; reliable: boolean }[];
   }>({});
   const [error, setError] = useState("");
   const [labels, setLabels] = useState<
@@ -155,6 +163,7 @@ function Preview({
       timer: ReturnType<typeof setTimeout>;
     const controller = new AbortController();
     let pending = "";
+    let revision = "";
     async function poll() {
       const began = performance.now();
       let interval = intervalMs;
@@ -164,7 +173,7 @@ function Preview({
       }
       try {
         const response = await fetch(
-          `/api/v1/local/cameras/${camera.id}/frame`,
+          `/api/v1/local/cameras/${camera.id}/frame${revision ? `?after=${encodeURIComponent(revision)}` : ""}`,
           {
             credentials: "same-origin",
             cache: "no-store",
@@ -175,6 +184,10 @@ function Preview({
           throw new Error(
             "Waiting for a recent frame. Check the camera connection status.",
           );
+        if (response.status === 204) {
+          if (!cancelled) timer = setTimeout(poll, interval);
+          return;
+        }
         const blob = await response.blob();
         if (cancelled) return;
         const next = URL.createObjectURL(blob);
@@ -187,6 +200,7 @@ function Preview({
           pending = "";
           return;
         }
+        revision = response.headers.get("X-Preview-Revision") || "";
         const previous = current;
         current = next;
         pending = "";
@@ -269,6 +283,81 @@ function Preview({
               pointerEvents: "none",
             }}
           >
+            {geometry.door?.zones.map((zone) => (
+              <polygon
+                key={`door-${zone.role}`}
+                points={zone.points.map((p) => p.join(",")).join(" ")}
+                fill={
+                  zone.role === "transition"
+                    ? "#e4a321"
+                    : zone.role === "a"
+                      ? "#2f80ed"
+                      : "#2a9b62"
+                }
+                fillOpacity={0.15}
+                stroke={zone.role === "transition" ? "#e4a321" : "#fff"}
+                strokeWidth={0.003}
+              />
+            ))}
+            {geometry.door &&
+              (() => {
+                const zone = geometry.door;
+                const ordered = ["a", "transition", "b"].map((role) =>
+                  zone.zones.find((z) => z.role === role),
+                );
+                if (ordered.some((z) => !z?.points.length)) return null;
+                const centers = ordered.map((z) =>
+                  z!.points.reduce(
+                    (a, p) => [
+                      a[0] + p[0] / z!.points.length,
+                      a[1] + p[1] / z!.points.length,
+                    ],
+                    [0, 0],
+                  ),
+                );
+                if (!zone.entry_forward) centers.reverse();
+                return (
+                  <g>
+                    <defs>
+                      <marker
+                        id={`door-entry-${camera.id}`}
+                        viewBox="0 0 10 10"
+                        refX="9"
+                        refY="5"
+                        markerWidth="7"
+                        markerHeight="7"
+                        orient="auto"
+                      >
+                        <path d="M 0 0 L 10 5 L 0 10 z" fill="#fff" />
+                      </marker>
+                    </defs>
+                    <polyline
+                      points={centers.map((p) => p.join(",")).join(" ")}
+                      fill="none"
+                      stroke="#fff"
+                      strokeWidth={0.003}
+                      markerEnd={`url(#door-entry-${camera.id})`}
+                    />
+                    <text
+                      x={centers[1][0]}
+                      y={centers[1][1]}
+                      fontSize={0.025}
+                      fill="#fff"
+                    >
+                      ENTRY
+                    </text>
+                  </g>
+                );
+              })()}
+            {geometry.anchors?.map((anchor) => (
+              <circle
+                key={`anchor-${anchor.track_id}`}
+                cx={anchor.point[0]}
+                cy={anchor.point[1]}
+                r={0.005}
+                fill={anchor.reliable ? "#fff" : "#aaa"}
+              />
+            ))}
             {geometry.zones?.map((zone, index) => (
               <g key={index}>
                 <polygon
@@ -803,6 +892,7 @@ export default function LocalVision({
     [presence, setPresence] = useState<Presence | null>(null),
     [events, setEvents] = useState<IdentityEvent[]>([]);
   const [zoneCamera, setZoneCamera] = useState<LocalCamera | null>(null);
+  const [doorCamera, setDoorCamera] = useState<LocalCamera | null>(null);
   const [error, setError] = useState(""),
     [notice, setNotice] = useState(""),
     [busy, setBusy] = useState(false),
@@ -988,7 +1078,11 @@ export default function LocalVision({
                 </div>
                 <Preview
                   camera={camera}
-                  paused={selected?.id === camera.id}
+                  paused={
+                    selected?.id === camera.id ||
+                    previewCamera?.id === camera.id ||
+                    doorCamera?.id === camera.id
+                  }
                   intervalMs={cameras.length > 4 ? 250 : 67}
                 />
                 <button
@@ -1448,6 +1542,14 @@ export default function LocalVision({
         />
       )}
       {tab === "Daily matrices" && <DailyProfiles siteId={siteId} />}
+      {doorCamera && (
+        <Dialog
+          title={`Door zones · ${doorCamera.name}`}
+          close={() => setDoorCamera(null)}
+        >
+          <DoorZoneEditor camera={doorCamera} />
+        </Dialog>
+      )}
       {zoneCamera && (
         <Dialog
           title={`Workstation areas · ${zoneCamera.name}`}
@@ -1582,6 +1684,18 @@ export default function LocalVision({
         <Dialog title={previewCamera.name} close={() => setSelected(null)}>
           <div className="modal-form">
             <Preview camera={previewCamera} />
+            <DoorwayTimeLogs camera={previewCamera} />
+            {canManage && (
+              <button
+                className="button secondary"
+                onClick={() => {
+                  setDoorCamera(previewCamera);
+                  setSelected(null);
+                }}
+              >
+                Door zones / Entry–Exit
+              </button>
+            )}
             <div className="vision-live-info">
               <span>
                 Stream: <strong>{previewCamera.state}</strong>

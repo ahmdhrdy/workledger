@@ -154,6 +154,10 @@ def register(app, factory, current_user, site_for, employee_for, audit, settings
                 "message": "Cannot discover/open stream. Check ONVIF access, camera time, IP and credentials. Use manual RTSP if discovery is unsupported.",
             }
 
+    from .door_routes import register_door_routes
+
+    register_door_routes(app, local, current_user, db_dependency, camera_for, site_for, audit)
+
     @app.get("/api/v1/local/status")
     def status(runtime=Depends(local), user=Depends(current_user)):
         return {
@@ -355,6 +359,7 @@ def register(app, factory, current_user, site_for, employee_for, audit, settings
     def frame(
         identifier: str,
         raw: bool = False,
+        after: str | None = None,
         runtime=Depends(local),
         user=Depends(current_user),
         db=Depends(db_dependency),
@@ -365,31 +370,41 @@ def register(app, factory, current_user, site_for, employee_for, audit, settings
             if preview is None:
                 preview = PreviewTracker()
                 runtime.preview_trackers[identifier] = preview
-        # Acquire the preview lock before choosing the frame. Concurrent viewers
-        # must not advance geometry beyond the image returned to an older request.
-        with preview.lock:
-            with runtime.lock:
+        # A running preview worker publishes an immutable frame/geometry pair.
+        # HTTP never waits for optical flow or replay of delayed detections.
+        worker_running = runtime.door_thread.is_alive()
+        with runtime.lock:
+            packet = runtime.preview_frames.get(identifier) if worker_running and not raw else None
+            door_config = runtime.doors.config(identifier)
+        observations = []
+        if packet is not None:
+            frame, overlay, result, observations = packet
+        elif raw or worker_running:
+            frame = runtime.latest_frame(identifier)
+            overlay = None
+            result = {"labels": [], "people": -1, "analysis_age_ms": -1, "tracking_ms": 0}
+        else:
+            # Test/embedded runtimes that have not started their worker.
+            with preview.lock:
                 frame = runtime.latest_frame(identifier)
+                with runtime.lock:
+                    overlay = runtime.overlays.get(identifier)
                 if not frame or time.time() - frame["at"] > 8:
                     raise HTTPException(503, "No recent camera frame")
-                overlay = runtime.overlays.get(identifier)
-                content = frame["jpeg"]
-                timestamp = frame["at"]
-            result = (
-                preview.render(frame, overlay)
-                if not raw
-                else {
-                    "labels": [],
-                    "people": -1,
-                    "analysis_age_ms": -1,
-                    "tracking_ms": 0,
-                }
-            )
+                result = preview.render(frame, overlay)
+                observations = preview.door_observations(frame["at"], settings.confirmation_frames)
+        if not frame or time.time() - frame["at"] > 8:
+            raise HTTPException(503, "No recent camera frame")
+        content, timestamp = frame["jpeg"], frame["at"]
+        frame_key = f"{timestamp}:{(overlay or {}).get('revision', 0)}"
+        if not raw and after == frame_key:
+            return Response(status_code=204, headers={"Cache-Control": "no-store"})
         return Response(
             content,
             media_type="image/jpeg",
             headers={
                 "X-Captured-At": str(timestamp),
+                "X-Preview-Revision": frame_key,
                 "X-People-Count": str(result["people"]),
                 "X-Analysis-Age-Ms": str(result["analysis_age_ms"]),
                 "X-Preview-Tracking-Ms": str(result["tracking_ms"]),
@@ -397,7 +412,28 @@ def register(app, factory, current_user, site_for, employee_for, audit, settings
                 "Cache-Control": "no-store",
                 "X-Workledger-Geometry": base64.b64encode(
                     json.dumps(
-                        overlay.get("geometry", {}) if overlay and not raw else {},
+                        (
+                            {
+                                **(overlay.get("geometry", {}) if overlay else {}),
+                                "door": door_config
+                                if door_config and door_config.get("active")
+                                else None,
+                                "anchors": [
+                                    {
+                                        "track_id": o["track_id"],
+                                        "point": o[(door_config or {}).get("anchor", "foot")],
+                                        "reliable": o["reliable"],
+                                        "foot": o["foot"],
+                                        "torso": o["torso"],
+                                    }
+                                    for o in observations
+                                ]
+                                if not raw
+                                else [],
+                            }
+                            if not raw
+                            else {}
+                        ),
                         ensure_ascii=False,
                         separators=(",", ":"),
                     ).encode()

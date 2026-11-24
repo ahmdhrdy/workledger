@@ -64,6 +64,13 @@ def detection_overlay(frame, people, tracker, names, stage):
         )
         label = {
             "track_id": identifier,
+            "attendance_proof": {
+                "attendance_verified_at": track.attendance_verified_at if track else -1e9,
+                "attendance_employee_id": track.attendance_employee_id if track else None,
+                "hits": track.hits if track else 0,
+                "needs_reverification": track.needs_reverification if track else True,
+                "association_reliable": track.association_reliable if track else True,
+            },
             "name": names.get(employee, "Checking"),
             "confirmed": bool(employee),
             "locked": bool(employee),
@@ -89,7 +96,13 @@ def detection_overlay(frame, people, tracker, names, stage):
             )
             labels.append(label)
         persons.append(
-            {"id": identifier, "box": list(person["box"]), "face_box": face, "label": label}
+            {
+                "id": identifier,
+                "box": list(person["box"]),
+                "face_box": face,
+                "label": label,
+                "person_detected": person.get("person_detected", False),
+            }
         )
     return {
         "at": frame["at"],

@@ -1,3 +1,4 @@
+import copy
 import threading
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -94,22 +95,31 @@ class DailyGallery:
             )
             if existing and at - existing["updated_at"] < 30 and camera in existing["cameras"]:
                 return
-            profile = existing or {
-                "employee_id": employee,
-                "day": day,
-                "expires_at": expires,
-                "created_at": at,
-                "vectors": [],
-                "cameras": [],
-            }
+            profile = (
+                copy.deepcopy(existing)
+                if existing
+                else {
+                    "employee_id": employee,
+                    "day": day,
+                    "expires_at": expires,
+                    "created_at": at,
+                    "vectors": [],
+                    "cameras": [],
+                }
+            )
             profile.update(details or {})
             profile["updated_at"] = at
             if camera not in profile["cameras"]:
                 profile["cameras"].append(camera)
             profile["vectors"] = (profile["vectors"] + [normalized(vector).tolist()])[-12:]
-            self.store.put_daily_profile(site, employee, day, expires, profile)
-            if existing is None:
-                profiles.append(profile)
+        # A slow disk write must not hold the lock used by body matching.
+        # Publish the same new profile only after the write succeeds, so a retry
+        # cannot be suppressed by the 30-second in-memory sampling interval.
+        self.store.put_daily_profile(site, employee, day, expires, profile)
+        with self.lock:
+            profiles = self.profiles(site, at)
+            profiles[:] = [p for p in profiles if p["employee_id"] != employee or p["day"] != day]
+            profiles.append(profile)
 
     def match(self, site, vector, at, threshold, margin):
         if vector is None:

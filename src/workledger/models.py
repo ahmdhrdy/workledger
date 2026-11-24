@@ -244,3 +244,45 @@ class Audit(Base):
     target: Mapped[str] = mapped_column(String(100))
     detail: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
+
+
+class CameraDoorZone(Base):
+    __tablename__ = "camera_zones"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    camera_id: Mapped[str] = mapped_column(ForeignKey("cameras.id"), unique=True)
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), index=True)
+    site_id: Mapped[str] = mapped_column(ForeignKey("sites.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    active: Mapped[bool] = mapped_column(Boolean, default=False)
+    config: Mapped[dict] = mapped_column(JSON)
+    updated_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
+
+
+class DoorZoneVersion(Base):
+    __tablename__ = "camera_zone_versions"
+    zone_id: Mapped[str] = mapped_column(ForeignKey("camera_zones.id"), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    config: Mapped[dict] = mapped_column(JSON)
+    updated_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
+
+
+class DoorCrossing(Base):
+    __tablename__ = "door_crossings"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    zone_id: Mapped[str] = mapped_column(ForeignKey("camera_zones.id"), index=True)
+    zone_version: Mapped[int] = mapped_column(Integer)
+    camera_id: Mapped[str] = mapped_column(ForeignKey("cameras.id"), index=True)
+    company_id: Mapped[str] = mapped_column(ForeignKey("companies.id"), index=True)
+    site_id: Mapped[str] = mapped_column(ForeignKey("sites.id"), index=True)
+    track_id: Mapped[str] = mapped_column(String(100))
+    employee_id: Mapped[str | None] = mapped_column(ForeignKey("employees.id"), nullable=True)
+    kind: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20))
+    occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    received_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
+    source_event_id: Mapped[str | None] = mapped_column(
+        ForeignKey("source_events.id"), nullable=True, unique=True
+    )
+    details: Mapped[dict] = mapped_column(JSON)

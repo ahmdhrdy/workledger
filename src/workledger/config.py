@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -21,7 +22,9 @@ class Settings(BaseSettings):
     local_ai: bool = True
     local_data_dir: str = ".local/vision"
     model_dir: str = ".local/models"
-    inference_threads: int = 2
+    inference_threads: int = Field(
+        default_factory=lambda: min(4, max(1, (os.cpu_count() or 2) // 2))
+    )
     inference_fps: float = 2.0
     portal_inference_fps: float = 5.0
     face_threshold: float = 0.42

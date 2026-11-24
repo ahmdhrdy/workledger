@@ -526,7 +526,7 @@ def test_versioned_database_migration_and_unrecognized_schema_guard(tmp_path):
             == "Preserved Company"
         )
         assert (
-            db.execute(text("SELECT version_num FROM alembic_version")).scalar() == "a91f7302c114"
+            db.execute(text("SELECT version_num FROM alembic_version")).scalar() == "b72c9d310ae1"
         )
     assert list((tmp_path / "backups").glob("*.db"))
     engine.dispose()

@@ -3,6 +3,7 @@
 import threading
 import time
 from collections import deque
+from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -22,6 +23,8 @@ class PreviewTracker:
         self.entities = {}
         self.face_memory = {}
         self.max_age = max_age
+        self.result_key = None
+        self.result = None
 
     @staticmethod
     def _gray(jpeg):
@@ -45,7 +48,10 @@ class PreviewTracker:
         )
 
     def _seed(self, analysis):
-        gray, (width, height) = self._gray(analysis["source_jpeg"])
+        cached = next((item for item in reversed(self.history) if item[0] == analysis["at"]), None)
+        gray, (width, height) = (
+            (cached[1], cached[2]) if cached is not None else self._gray(analysis["source_jpeg"])
+        )
         scale = np.array([gray.shape[1] / width, gray.shape[0] / height] * 2)
         entities = {}
         for person in analysis["persons"]:
@@ -68,6 +74,8 @@ class PreviewTracker:
                     label = label or dict(memory["label"])
             entities[person["id"]] = {
                 "box": box,
+                "door_track_id": "door-" + uuid4().hex,
+                "person_detected": person.get("person_detected", True),
                 "source_box": np.asarray(person["box"], dtype=float),
                 "source_face": np.asarray(person["face_box"], dtype=float)
                 if person.get("face_box") is not None
@@ -120,6 +128,7 @@ class PreviewTracker:
         entities = {}
         for person, old_id, entity in matched:
             entity["label"] = dict(person.get("label") or {})
+            entity["person_detected"] = person.get("person_detected", True)
             entities[person["id"]] = entity
             if old_id != person["id"] and old_id in self.face_memory:
                 self.face_memory[person["id"]] = self.face_memory.pop(old_id)
@@ -273,6 +282,9 @@ class PreviewTracker:
         began = time.perf_counter()
         with self.lock:
             timestamp = frame["at"]
+            key = (timestamp, id(analysis), analysis.get("revision", 0) if analysis else None)
+            if key == self.result_key:
+                return self.result
             if not self.history or timestamp != self.history[-1][0]:
                 gray, dimensions = self._gray(frame["jpeg"])
                 self.history.append((timestamp, gray, dimensions))
@@ -302,6 +314,7 @@ class PreviewTracker:
                 for at, gray, _ in self.history:
                     if at > self.at:
                         self._advance(gray, at)
+                self._carry_door_ids(previous, timestamp)
                 incoming = {person["id"]: person for person in analysis["persons"]}
                 # Keep current visual geometry rather than snapping back to delayed inference.
                 for identifier, entity in previous.items():
@@ -409,12 +422,75 @@ class PreviewTracker:
                     },
                 )
             )
-            return {
-                "labels": labels,
+            self.result_key = key
+            self.result = {
+                "labels": self._visible_labels(labels),
                 "people": len(self.entities) if self.entities or age <= self.max_age else -1,
                 "analysis_age_ms": round(age * 1000),
                 "tracking_ms": round((time.perf_counter() - began) * 1000, 1),
             }
+            return self.result
+
+    def _visible_labels(self, labels):
+        """Face-level suppression for presentation only. Never merge tracking state."""
+
+        def priority(label):
+            entity = self.entities.get(label.get("track_id"), {})
+            return (
+                bool(label.get("locked") or label.get("confirmed")),
+                not entity.get("carried", False),
+                entity.get("detected_at", -1),
+                entity.get("face_tracked_at", -1),
+                label.get("detection_score", 0),
+            )
+
+        def duplicate(left, right):
+            # Never hide two different positively identified employees.
+            a_id, b_id = left.get("employee_id"), right.get("employee_id")
+            if a_id and b_id and a_id != b_id and left.get("locked") and right.get("locked"):
+                return False
+            if (
+                min(
+                    left.get("width", 0),
+                    left.get("height", 0),
+                    right.get("width", 0),
+                    right.get("height", 0),
+                )
+                <= 0
+            ):
+                return False
+            a = np.array(
+                [left["x"], left["y"], left["x"] + left["width"], left["y"] + left["height"]]
+            )
+            b = np.array(
+                [right["x"], right["y"], right["x"] + right["width"], right["y"] + right["height"]]
+            )
+            sizes_a, sizes_b = a[2:] - a[:2], b[2:] - b[:2]
+            areas = float(np.prod(sizes_a)), float(np.prod(sizes_b))
+            intersection = float(
+                np.prod(np.maximum(0, np.minimum(a[2:], b[2:]) - np.maximum(a[:2], b[:2])))
+            )
+            overlap = intersection / max(sum(areas) - intersection, 1e-12)
+            containment = intersection / max(min(areas), 1e-12)
+            ratio = max(areas) / max(min(areas), 1e-12)
+            center_distance = np.linalg.norm(
+                ((a[:2] + a[2:]) - (b[:2] + b[2:])) / np.maximum(sizes_a + sizes_b, 1e-12)
+            )
+            if ratio <= 3 and center_distance <= 0.6 and (overlap >= 0.4 or containment >= 0.8):
+                return True
+            carried = any(
+                self.entities.get(label.get("track_id"), {}).get("carried", False)
+                for label in (left, right)
+            )
+            return carried and ratio <= 2 and center_distance <= 0.5 and overlap >= 0.2
+
+        ranked = sorted(enumerate(labels), key=lambda item: priority(item[1]), reverse=True)
+        kept = []
+        for index, label in ranked:
+            if not any(duplicate(label, other) for _, other in kept):
+                kept.append((index, label))
+        # Stable order avoids unrelated labels being rearranged between frames.
+        return [label for _, label in sorted(kept)]
 
     def hints_at(self, timestamp):
         """Return past-only geometry pinned to the exact inference source time."""
@@ -423,3 +499,73 @@ class PreviewTracker:
                 if at <= timestamp and timestamp - at <= 0.25:
                     return {key: dict(value) for key, value in hints.items()}
             return {}
+
+    def _carry_door_ids(self, previous, at):
+        """Geometry-only continuity across provisional/authoritative preview ID revisions.
+
+        Never transfers an employee label or face proof. Crowded/ambiguous pairs
+        receive a new door trajectory rather than borrowing another person's path.
+        """
+        eligible = {
+            key: entity
+            for key, entity in previous.items()
+            if 0 <= at - entity["body_tracked_at"] <= 0.25
+        }
+        for key, entity in self.entities.items():
+            ranked = sorted(
+                (
+                    (iou(entity["box"], old["box"]), old_key, old)
+                    for old_key, old in eligible.items()
+                ),
+                key=lambda item: item[0],
+                reverse=True,
+            )
+            if not ranked or ranked[0][0] < 0.5:
+                continue
+            if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.15:
+                continue
+            score, old_key, old = ranked[0]
+            competitors = [
+                iou(other["box"], old["box"])
+                for other_key, other in self.entities.items()
+                if other_key != key
+            ]
+            if competitors and score - max(competitors) < 0.15:
+                continue
+            left, right = entity["label"].get("employee_id"), old["label"].get("employee_id")
+            if left and right and left != right:
+                continue
+            entity["door_track_id"] = old.get("door_track_id", str(old_key))
+
+    def door_observations(self, at, required_hits):
+        """Only observed torso geometry; never the smoothed face rectangle."""
+        with self.lock:
+            if self.gray is None:
+                return []
+            h, w = self.gray.shape
+            observations = []
+            for identifier, entity in self.entities.items():
+                x1, y1, x2, y2 = entity["box"]
+                label = entity["label"]
+                proof = label.get("attendance_proof", {})
+                observations.append(
+                    {
+                        "track_id": entity.get("door_track_id", str(identifier)),
+                        "visual_track_id": identifier,
+                        "identity_reliable": proof.get("association_reliable", True),
+                        "confidence": label.get("score"),
+                        "foot": [float((x1 + x2) / 2 / w), float(y2 / h)],
+                        "torso": [float((x1 + x2) / 2 / w), float((y1 + y2) / 2 / h)],
+                        "employee_id": label.get("employee_id") if label.get("locked") else None,
+                        "reliable": bool(
+                            0 <= at - entity["body_tracked_at"] <= 0.25
+                            and entity.get("person_detected", True)
+                        ),
+                        "attendance_verified_at": proof.get("attendance_verified_at", -1e9),
+                        "attendance_employee_id": proof.get("attendance_employee_id"),
+                        "hits": proof.get("hits", 0),
+                        "required_hits": required_hits,
+                        "needs_reverification": proof.get("needs_reverification", True),
+                    }
+                )
+            return observations

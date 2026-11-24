@@ -4,6 +4,7 @@ import time
 from collections import Counter, deque
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import cv2
@@ -14,7 +15,9 @@ from workledger.domain import digest
 from workledger.models import Camera, Employee, Site, SourceEvent
 
 from .appearance import DailyGallery, clothing_colors, day_window
+from .background import BackgroundIO
 from .capture import Decoder
+from .door_service import DoorZoneService
 from .downloads import missing
 from .face_engine import MODEL_REVISION, model_identity
 from .flow import Flow
@@ -53,6 +56,8 @@ class VisionRuntime:
         self.gallery_index = GalleryIndex(
             settings.local_data_dir, self.model_id, settings, factory=factory
         )
+        self.doors = DoorZoneService(factory)
+        self.io = BackgroundIO()
         self.gallery_errors = {}
         self.gallery_build_lock = threading.RLock()
         self.lock = threading.RLock()
@@ -63,6 +68,7 @@ class VisionRuntime:
         self.workers, self.states, self.frames, self.trackers = {}, {}, {}, {}
         self.overlays = {}
         self.preview_trackers = {}
+        self.preview_frames = {}
         self.configs = {}
         self.processed, self.last_inference = {}, {}
         self.refresh_times = {}
@@ -77,9 +83,15 @@ class VisionRuntime:
         self.last_observation = {}
         self.last_retention = 0
         self.thread = threading.Thread(target=self.loop, name="local-vision", daemon=True)
+        self.door_thread = threading.Thread(
+            target=self.preview_loop, name="preview-geometry", daemon=True
+        )
 
     def start(self):
+        self.io.start()
+        self.doors.start()
         self.thread.start()
+        self.door_thread.start()
         if not missing(self.settings.model_dir):
             threading.Thread(target=self.load_model, daemon=True).start()
         for identifier in self.store.camera_ids():
@@ -100,6 +112,7 @@ class VisionRuntime:
                 if self.stop.is_set():
                     break
                 try:
+                    doors = getattr(self, "doors", None)
                     # Same lock order as the frame route: preview then runtime.
                     with preview.lock:
                         with self.lock:
@@ -110,19 +123,46 @@ class VisionRuntime:
                         if not frame or time.time() - frame["at"] > 2:
                             continue
                         result = preview.render(frame, overlay)
+                        door_observations = preview.door_observations(
+                            frame["at"], getattr(self.settings, "confirmation_frames", 3)
+                        )
+                    doors = getattr(self, "doors", None)
+                    if doors is not None:
+                        doors.observe(identifier, door_observations, frame["at"])
                     with self.lock:
                         if self.preview_trackers.get(identifier) is preview:
+                            if hasattr(self, "preview_frames"):
+                                self.preview_frames[identifier] = (
+                                    frame,
+                                    overlay,
+                                    result,
+                                    door_observations,
+                                )
                             self.states.setdefault(identifier, {}).update(
                                 visual_tracking_at=frame["at"],
                                 visual_tracking_ms=result["tracking_ms"],
                                 visual_people=result["people"],
                                 visual_tracking_error=False,
                             )
-                except Exception:
+                except Exception as error:
                     with self.lock:
+                        if not self.states.get(identifier, {}).get("visual_tracking_error"):
+                            logger.warning(
+                                "Preview/door geometry failed camera=%s error_type=%s",
+                                identifier,
+                                type(error).__name__,
+                            )
                         self.states.setdefault(identifier, {}).update(visual_tracking_error=True)
             self.stop.wait(
-                max(0.005, 1 / self.settings.visual_tracking_fps - (time.monotonic() - began))
+                max(
+                    0.005,
+                    1
+                    / max(
+                        self.settings.visual_tracking_fps,
+                        min(getattr(self.settings, "live_fps", 10), 15),
+                    )
+                    - (time.monotonic() - began),
+                )
             )
 
     def load_model(self):
@@ -188,6 +228,7 @@ class VisionRuntime:
             self.frames.pop(identifier, None)
             self.overlays.pop(identifier, None)
             self.preview_trackers.pop(identifier, None)
+            self.preview_frames.pop(identifier, None)
             self.configs.pop(identifier, None)
             self.trackers.pop(identifier, None)
             self.flows.pop(identifier, None)
@@ -204,6 +245,9 @@ class VisionRuntime:
     def shutdown(self):
         self.stop.set()
         self.thread.join(timeout=5)
+        self.door_thread.join(timeout=4)
+        self.doors.shutdown()
+        self.io.shutdown()
         for identifier in list(self.workers):
             self.disconnect(identifier, disable=False)
 
@@ -250,6 +294,7 @@ class VisionRuntime:
                 result["decoded_fps"] = 0
                 result["full_refresh_fps"] = 0
                 result.pop("frame_age_ms", None)
+            result.update(self.io.status())
             return result
 
     def templates(self, company, site):
@@ -299,6 +344,7 @@ class VisionRuntime:
                     self.flows[camera] = Flow()
                     self.overlays.pop(camera, None)
                     self.preview_trackers[camera] = PreviewTracker()
+                    self.preview_frames.pop(camera, None)
         try:
             self.templates(company, site)
             self.gallery_errors.pop((company, site), None)
@@ -308,9 +354,50 @@ class VisionRuntime:
             self.gallery_errors[(company, site)] = type(error).__name__
             return {"status": "pending_rebuild", "error": "Gallery export failed; retry rebuild."}
 
-    def write_event(self, identifier, config, track, captured, jpeg=None, force_unknown=False):
-        employee = None if force_unknown else track.employee_id
+    def queue_event(self, identifier, config, track, captured, jpeg=None, force_unknown=False):
+        # Freeze only data consumed by write_event, never the mutable live track.
+        body = track.latest.get("body")
+        snapshot = SimpleNamespace(
+            employee_id=track.employee_id,
+            score=track.score,
+            latest={
+                "body": body.copy() if body is not None else None,
+                "clothing": dict(track.latest.get("clothing", {})),
+            },
+        )
+        return self.io.submit(
+            self.write_event,
+            identifier,
+            dict(config),
+            snapshot,
+            captured,
+            jpeg,
+            force_unknown,
+            str(uuid4()),
+        )
+
+    def seed_appearance(self, site, employee_id, identifier, vector, captured, timezone, clothing):
         with self.factory() as db:
+            employee = db.get(Employee, employee_id)
+            if employee is None:
+                return
+            details = {
+                "name": employee.name,
+                "code": employee.code,
+                "nickname": employee.nickname,
+                "clothing": clothing,
+                "source": "face",
+            }
+        self.gallery.add(site, employee_id, identifier, vector, captured, timezone, details)
+
+    def write_event(
+        self, identifier, config, track, captured, jpeg=None, force_unknown=False, event_id=None
+    ):
+        employee = None if force_unknown else track.employee_id
+        event_id = event_id or str(uuid4())
+        with self.factory() as db:
+            if db.get(SourceEvent, event_id) is not None:
+                return True
             if employee:
                 active = db.scalar(
                     select(Employee.id).where(
@@ -340,7 +427,6 @@ class VisionRuntime:
                 ):
                     return False
             self.sequence += 1
-            event_id = str(uuid4())
             payload = {
                 "id": event_id,
                 "employee": employee,
@@ -385,11 +471,23 @@ class VisionRuntime:
             )
         return True
 
+    def purge_retention(self):
+        with self.factory() as db:
+            for site in db.scalars(select(Site)).all():
+                camera_ids = db.scalars(
+                    select(Camera.id).where(
+                        Camera.site_id == site.id, Camera.company_id == site.company_id
+                    )
+                ).all()
+                before = time.time() - site.retention_days * 86400
+                self.store.purge_evidence(camera_ids, before)
+                self.store.purge_observations(camera_ids, before)
+
     def loop(self):
         while not self.stop.wait(0.015):
             if time.time() - self.last_daily_purge > 1:
                 current = time.time()
-                self.store.purge_daily(current)
+                self.io.submit(self.store.purge_daily, current)
                 # Also remove expired identities from live boxes at midnight.
                 for camera_id, config in list(self.configs.items()):
                     day, _ = day_window(current, config.get("timezone", "Asia/Dhaka"))
@@ -403,22 +501,7 @@ class VisionRuntime:
                     config["identity_day"] = day
                 self.last_daily_purge = current
             if time.time() - self.last_retention > 3600:
-                try:
-                    with self.factory() as db:
-                        for site in db.scalars(select(Site)).all():
-                            camera_ids = db.scalars(
-                                select(Camera.id).where(
-                                    Camera.site_id == site.id, Camera.company_id == site.company_id
-                                )
-                            ).all()
-                            self.store.purge_evidence(
-                                camera_ids, time.time() - site.retention_days * 86400
-                            )
-                            self.store.purge_observations(
-                                camera_ids, time.time() - site.retention_days * 86400
-                            )
-                    self.last_retention = time.time()
-                except Exception:
+                if self.io.submit(self.purge_retention):
                     self.last_retention = time.time()
             with self.lock:
                 identifiers = sorted(
@@ -473,6 +556,7 @@ class VisionRuntime:
                     names = {
                         sample["employee_id"]: sample.get("name", "Unknown") for sample in templates
                     }
+                    camera_zones = self.store.zones(identifier)
 
                     def publish_progress(detected_people, stage):
                         snapshot = detection_overlay(
@@ -493,6 +577,8 @@ class VisionRuntime:
                             )
                             self.overlays[identifier] = snapshot
 
+                    door_config = self.doors.config(identifier)
+                    door_active = bool(door_config and door_config.get("active"))
                     people = (
                         self.model.analyze(
                             image,
@@ -501,7 +587,7 @@ class VisionRuntime:
                             tracker=active_tracker,
                             on_progress=publish_progress,
                             at=frame["at"],
-                            role=config["role"],
+                            role="entry" if door_active else config["role"],
                             matcher=self.gallery_index.entries[
                                 (config["company_id"], config["site_id"])
                             ]["matcher"],
@@ -587,26 +673,18 @@ class VisionRuntime:
                                 "body_fresh", True
                             ):
                                 track.latest["clothing"] = clothing_colors(image, track.box)
-                                with self.factory() as db:
-                                    employee = db.get(Employee, track.employee_id)
-                                    details = {
-                                        "name": employee.name,
-                                        "code": employee.code,
-                                        "nickname": employee.nickname,
-                                        "clothing": track.latest["clothing"],
-                                        "source": "face",
-                                    }
-                                self.gallery.add(
+                                self.io.submit(
+                                    self.seed_appearance,
                                     config["site_id"],
                                     track.employee_id,
                                     identifier,
-                                    track.latest["body"],
+                                    track.latest["body"].copy(),
                                     frame["at"],
                                     config.get("timezone", "Asia/Dhaka"),
-                                    details,
+                                    dict(track.latest["clothing"]),
                                 )
                         # Attendance never accepts a body-only similarity.
-                        if full_refresh and config["role"] in {"entry", "exit"}:
+                        if full_refresh and config["role"] in {"entry", "exit"} and not door_active:
                             ready = portal_ready(
                                 track,
                                 config,
@@ -623,39 +701,43 @@ class VisionRuntime:
                                     else not track.emitted
                                 )
                             ):
-                                self.write_event(
+                                if self.queue_event(
                                     identifier, config, track, frame["at"], frame["jpeg"]
-                                )
-                                track.emitted = True
-                                track.crossing_emitted_at = track.crossing_at
-                        if full_refresh and (
-                            (
-                                not track.employee_id
-                                or config["role"] in {"entry", "exit"}
-                                and not track.is_locked
-                            )
-                            and track.observations >= 8
-                            and not track.unknown_emitted
+                                ):
+                                    track.emitted = True
+                                    track.crossing_emitted_at = track.crossing_at
+                        if (
+                            full_refresh
+                            and not door_active
                             and (
-                                config["role"] == "interior"
-                                and track.latest.get("face_vector") is not None
-                                or config["role"] != "interior"
+                                (
+                                    not track.employee_id
+                                    or config["role"] in {"entry", "exit"}
+                                    and not track.is_locked
+                                )
+                                and track.observations >= 8
+                                and not track.unknown_emitted
                                 and (
-                                    config.get("trigger", "presence") == "presence"
-                                    or track.crossing_at
+                                    config["role"] == "interior"
+                                    and track.latest.get("face_vector") is not None
+                                    or config["role"] != "interior"
+                                    and (
+                                        config.get("trigger", "presence") == "presence"
+                                        or track.crossing_at
+                                    )
                                 )
                             )
                         ):
                             track.latest["clothing"] = clothing_colors(image, track.box)
-                            self.write_event(
+                            if self.queue_event(
                                 identifier,
                                 config,
                                 track,
                                 frame["at"],
                                 frame["jpeg"],
                                 force_unknown=True,
-                            )
-                            track.unknown_emitted = True
+                            ):
+                                track.unknown_emitted = True
                         if (
                             config["role"] == "interior"
                             and full_refresh
@@ -670,10 +752,11 @@ class VisionRuntime:
                                 zone = membership(
                                     track.box,
                                     image.shape,
-                                    self.store.zones(identifier),
+                                    camera_zones,
                                     track.employee_id,
                                 )
-                                self.store.observe(
+                                accepted = self.io.submit(
+                                    self.store.observe,
                                     track.employee_id,
                                     identifier,
                                     frame["at"],
@@ -690,7 +773,8 @@ class VisionRuntime:
                                     )
                                     else "outside_allowed_time",
                                 )
-                                self.last_observation[key] = frame["at"]
+                                if accepted:
+                                    self.last_observation[key] = frame["at"]
                         face_box = track.latest.get("face_box")
                         if face_box is None:
                             continue
@@ -702,7 +786,7 @@ class VisionRuntime:
                         name = next(
                             (
                                 s.get("name", s["employee_id"][:8])
-                                for s in self.templates(config["company_id"], config["site_id"])
+                                for s in templates
                                 if s["employee_id"] == display_identity
                             ),
                             "Unknown",
@@ -719,10 +803,7 @@ class VisionRuntime:
                             (time.perf_counter() - began) * 1000, 1
                         )
                         continue
-                    employee_names = {
-                        sample["employee_id"]: sample.get("name", "Unknown")
-                        for sample in self.templates(config["company_id"], config["site_id"])
-                    }
+                    employee_names = names
                     with self.lock:
                         if (
                             identifier not in self.workers
@@ -733,6 +814,13 @@ class VisionRuntime:
                         labels = [
                             {
                                 "track_id": t.id,
+                                "attendance_proof": {
+                                    "attendance_verified_at": t.attendance_verified_at,
+                                    "attendance_employee_id": t.attendance_employee_id,
+                                    "hits": t.hits,
+                                    "needs_reverification": t.needs_reverification,
+                                    "association_reliable": t.association_reliable,
+                                },
                                 "transition_reason": t.transition_reason,
                                 "name": t.latest.get("display_name", "Unknown")[:32],
                                 "x": max(0, min(0.95, t.latest["face_box"][0] / w)),
@@ -791,6 +879,7 @@ class VisionRuntime:
                             "persons": [
                                 {
                                     "id": track.id,
+                                    "person_detected": track.latest.get("person_detected", False),
                                     "box": list(track.box),
                                     "face_box": track.latest.get(
                                         "preview_face_box", track.latest.get("face_box")
@@ -803,6 +892,13 @@ class VisionRuntime:
                                         ),
                                         {
                                             "track_id": track.id,
+                                            "attendance_proof": {
+                                                "attendance_verified_at": track.attendance_verified_at,
+                                                "attendance_employee_id": track.attendance_employee_id,
+                                                "hits": track.hits,
+                                                "needs_reverification": track.needs_reverification,
+                                                "association_reliable": track.association_reliable,
+                                            },
                                             "transition_reason": track.transition_reason,
                                             "name": employee_names.get(
                                                 track.display_employee_id, "Unknown"
@@ -832,7 +928,7 @@ class VisionRuntime:
                             "geometry": {
                                 "zones": [
                                     {"name": zone["name"], "points": zone["points"]}
-                                    for zone in self.store.zones(identifier)
+                                    for zone in camera_zones
                                 ],
                                 "line": {
                                     "axis": config.get("line_axis", "vertical"),
